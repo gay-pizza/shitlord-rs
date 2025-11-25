@@ -15,6 +15,6 @@ pub(crate) trait State {
 #[allow(dead_code)]
 pub(crate) enum StateCmd {
   ChangeState(Box<dyn State>),
-  Quit(u8),
+  Quit,
   Continue,
 }

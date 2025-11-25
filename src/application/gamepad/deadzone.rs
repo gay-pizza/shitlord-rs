@@ -1,5 +1,6 @@
 use crate::maths::vector2::Vec2f;
 
+#[allow(dead_code)]
 pub(crate) trait DeadZone {
   fn axis_deadzone(&self, min: Self, max: Self) -> Self;
 }

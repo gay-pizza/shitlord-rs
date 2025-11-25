@@ -19,7 +19,6 @@ pub(crate) mod keyboard;
 pub(crate) struct Application {
   window: *mut SDL_Window,
   renderer: Option<Renderer>,
-  should_quit: bool,
   state: Option<Box<dyn State>>,
   time: TimeHelper,
   fps_counter: FPSCalculator,
@@ -28,11 +27,10 @@ pub(crate) struct Application {
 }
 
 impl Application {
-  fn new() -> Application {
+  pub(crate) fn new() -> Application {
     Application {
       window: null_mut(),
       renderer: None,
-      should_quit: false,
       state: None,
       time: Default::default(),
       fps_counter: Default::default(),
@@ -52,8 +50,9 @@ impl Application {
     }
   }
 
-  fn init(&mut self) -> Result<(), AppError> {
+  pub(crate) fn init(&mut self) -> Result<(), AppError> {
     unsafe {
+      SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
       if !SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD) {
         return Err(AppError::Error(format!("SDL_Init failed: {}",
           CStr::from_ptr(SDL_GetError()).to_string_lossy())));
@@ -76,30 +75,45 @@ impl Application {
   }
 
   #[allow(unsafe_op_in_unsafe_fn)]
-  unsafe fn event(&mut self, event: SDL_Event) {
+  pub(crate) unsafe fn event(&mut self, event: SDL_Event) -> SDL_AppResult {
     match SDL_EventType(event.r#type) {
-      SDL_EVENT_QUIT => self.should_quit = true,
+      SDL_EVENT_QUIT => SDL_APP_SUCCESS,
       SDL_EVENT_KEY_DOWN | SDL_EVENT_KEY_UP => match event.key.key {
-        SDLK_RETURN if event.key.down && !event.key.repeat && event.key.r#mod & SDL_KMOD_ALT != 0 =>
-          { SDL_SetWindowFullscreen(self.window, !self.currently_fullscreen); }
-        SDLK_ESCAPE => self.should_quit = true,
-        _ => Keyboard::key_event(event.key.scancode, event.key.down, event.key.repeat)
+        SDLK_ESCAPE => SDL_APP_SUCCESS,
+        SDLK_RETURN if event.key.down && !event.key.repeat && event.key.r#mod & SDL_KMOD_ALT != 0 => {
+          SDL_SetWindowFullscreen(self.window, !self.currently_fullscreen);
+          SDL_APP_CONTINUE
+        }
+        _ => {
+          Keyboard::key_event(event.key.scancode, event.key.down, event.key.repeat);
+          SDL_APP_CONTINUE
+        }
       }
-      SDL_EVENT_WINDOW_ENTER_FULLSCREEN => self.currently_fullscreen = true,
-      SDL_EVENT_WINDOW_LEAVE_FULLSCREEN => self.currently_fullscreen = false,
-      SDL_EVENT_GAMEPAD_ADDED => GamePad::connected_event(event.gdevice.which),
-      SDL_EVENT_GAMEPAD_REMOVED => GamePad::removed_event(event.gdevice.which),
-      SDL_EVENT_GAMEPAD_BUTTON_DOWN | SDL_EVENT_GAMEPAD_BUTTON_UP =>
-        GamePad::button_event(
-          event.gbutton.which,
-          SDL_GamepadButton(event.gbutton.button as c_int),
-          event.gbutton.down),
-      SDL_EVENT_GAMEPAD_AXIS_MOTION =>
-        GamePad::axis_event(
-          event.gaxis.which,
-          SDL_GamepadAxis(event.gaxis.axis as c_int),
-          event.gaxis.value),
-      _ => ()
+      SDL_EVENT_WINDOW_ENTER_FULLSCREEN => {
+        self.currently_fullscreen = true;
+        SDL_APP_CONTINUE
+      }
+      SDL_EVENT_WINDOW_LEAVE_FULLSCREEN => {
+        self.currently_fullscreen = false;
+        SDL_APP_CONTINUE
+      }
+      SDL_EVENT_GAMEPAD_ADDED => {
+        GamePad::connected_event(event.gdevice.which);
+        SDL_APP_CONTINUE
+      }
+      SDL_EVENT_GAMEPAD_REMOVED => {
+        GamePad::removed_event(event.gdevice.which);
+        SDL_APP_CONTINUE
+      }
+      SDL_EVENT_GAMEPAD_BUTTON_DOWN | SDL_EVENT_GAMEPAD_BUTTON_UP => {
+        GamePad::button_event(event.gbutton.which, SDL_GamepadButton(event.gbutton.button as c_int), event.gbutton.down);
+        SDL_APP_CONTINUE
+      }
+      SDL_EVENT_GAMEPAD_AXIS_MOTION => {
+        GamePad::axis_event(event.gaxis.which, SDL_GamepadAxis(event.gaxis.axis as c_int), event.gaxis.value);
+        SDL_APP_CONTINUE
+      }
+      _ => SDL_APP_CONTINUE
     }
   }
 
@@ -114,7 +128,7 @@ impl Application {
     }
   }
 
-  fn free(&mut self) {
+  pub(crate) fn quit(&mut self) {
     if let Some(ref mut state) = self.state {
       state.quit();
     }
@@ -126,65 +140,53 @@ impl Application {
     }
   }
 
-  pub(crate) fn run() -> u8 {
-    unsafe { SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH) };
-    let mut app = Application::new();
-    if let Err(err) = app.init() {
-      eprintln!("ERROR: {:?}", err);
-      app.free();
-      return 1;
-    }
+  pub(crate) fn iterate(&mut self) -> SDL_AppResult {
+    self.time.frame_advance();
 
-    let mut exit_code = 0_u8;
-    while !app.should_quit {
-      app.time.frame_advance();
+    // Update FPS metrics
+    self.fps_counter.frame(self.time.get_duration(),
+      |s| self.fps_string = CString::new(format!("FPS: {}", s)).unwrap());
 
-      // Update FPS metrics
-      app.fps_counter.frame(app.time.get_duration(),
-        |s| app.fps_string = CString::new(format!("FPS: {}", s)).unwrap());
-
-      // Poll events
-      GamePad::advance_frame();
-      Keyboard::advance_frame();
-      unsafe {
-        let mut event: SDL_Event = std::mem::zeroed();
-        while SDL_PollEvent(addr_of_mut!(event)) {
-          app.event(event);
-        }
-      }
-
-      // Calculate delta time
-      const MIN_DELTA_TIME: f32 = 1.0 / 15.0;
-      let delta = f32::min(MIN_DELTA_TIME, app.time.get_deltatime() as f32);
-
-      // Tick and draw
-      let cmd = app.state.as_mut().map_or(StateCmd::Continue, |state| state.tick(delta));
-      app.draw(delta);
-
-      match cmd {
-        // Scene asked us to switch to a different one
-        StateCmd::ChangeState(new_state) => {
-          if let Some(mut state) = app.state.take() {
-            state.quit();
-          }
-          app.state = Some(new_state);
-          if let Some(ref mut new_state) = app.state {
-            new_state.load(app.renderer.as_mut().unwrap());
-            new_state.init();
-          }
-        }
-        // Scene returned quit
-        StateCmd::Quit(code) => {
-          exit_code = code;
-          app.should_quit = true;
-        }
-        // No command
-        StateCmd::Continue => {}
+    // Poll events
+    unsafe {
+      let mut event: SDL_Event = std::mem::zeroed();
+      while SDL_PollEvent(addr_of_mut!(event)) {
+        self.event(event);
       }
     }
 
-    app.free();
-    return exit_code;
+    // Calculate delta time
+    const MIN_DELTA_TIME: f32 = 1.0 / 15.0;
+    let delta = f32::min(MIN_DELTA_TIME, self.time.get_deltatime() as f32);
+
+    // Tick and draw
+    let cmd = self.state.as_mut().map_or(StateCmd::Continue, |state| state.tick(delta));
+    self.draw(delta);
+
+    match cmd {
+      // Scene asked us to switch to a different one
+      StateCmd::ChangeState(new_state) => {
+        if let Some(mut state) = self.state.take() {
+          state.quit();
+        }
+        self.state = Some(new_state);
+        if let Some(ref mut new_state) = self.state {
+          new_state.load(self.renderer.as_mut().unwrap());
+          new_state.init();
+        }
+      }
+      // Scene returned quit
+      StateCmd::Quit => {
+        return SDL_APP_SUCCESS
+      }
+      // No command
+      StateCmd::Continue => {}
+    }
+
+    GamePad::advance_frame();
+    Keyboard::advance_frame();
+
+    SDL_APP_CONTINUE
   }
 }
 
